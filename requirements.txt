@@ -1,0 +1,5 @@
+streamlit
+openai
+pypdf
+faiss-cpu
+numpy
