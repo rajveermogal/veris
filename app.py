@@ -1,18 +1,25 @@
 # app.py
 import os
 import re
+import json
+import time
 import streamlit as st
 from typing import Optional, Tuple, List, Dict, Any
 
+from openai import OpenAI
+
 from veris_core import (
+    Passage,
     pdf_bytes_to_passages,
     build_store,
-    search,
+    load_store,
+    save_store,
+    search_hybrid,
     make_context,
     answer_from_docs,
+    detect_doc_type_from_meta,
+    sha256_bytes,
 )
-
-from openai import OpenAI
 
 # -------------------------------------------------
 # Branding
@@ -31,12 +38,14 @@ client = OpenAI()
 # Constants
 # -------------------------------------------------
 SHOW_K = 6
-RETRIEVE_K = 24
+VEC_K = 28
+BM25_K = 28
+FINAL_K = 24
+RERANK_K = 12
 
-BASE_CONF = 0.22
-ENTITY_CONF = 0.10
-SUMMARY_CONF = 0.18
-GENERAL_FALLBACK_CONF = 0.16
+BASE_MIN_CONF = 0.22
+SUMMARY_MIN_CONF = 0.18
+ENTITY_MIN_CONF = 0.12
 
 DOC_CLASSIFY_PASSAGES = 16
 
@@ -55,95 +64,73 @@ if "doc_names" not in st.session_state:
     st.session_state.doc_names = []
 if "doc_type" not in st.session_state:
     st.session_state.doc_type = "unknown"
+if "store_dir" not in st.session_state:
+    st.session_state.store_dir = "./veris_store"
+if "active_docs" not in st.session_state:
+    st.session_state.active_docs = []
+if "kb_fingerprints" not in st.session_state:
+    st.session_state.kb_fingerprints = []
 
 # -------------------------------------------------
-# Helpers
+# Intent helpers
 # -------------------------------------------------
 def is_greeting(text: str) -> bool:
     t = (text or "").strip().lower()
     return t in {"hi", "hello", "hey", "yo", "good morning", "good afternoon", "good evening"}
 
-
 def is_summary_request(text: str) -> bool:
     t = (text or "").strip().lower()
     return any(x in t for x in ["summary", "summarize", "important points", "key points", "highlights", "important data"])
-
 
 def is_compare_request(text: str) -> bool:
     t = (text or "").strip().lower()
     return ("compare" in t) or (" vs " in t) or ("versus" in t)
 
-
 def is_entity_question(text: str) -> bool:
     t = (text or "").strip().lower()
     return any(x in t for x in ["who is", "who's", "who’s", "name of", "email of", "contact for", "phone", "address"])
-
 
 def looks_like_list_request(text: str) -> bool:
     t = (text or "").strip().lower()
     triggers = ["list", "what are the", "which are", "types of", "models", "parts", "features", "requirements", "steps"]
     return any(x in t for x in triggers)
 
-
 def looks_like_numbers_request(text: str) -> bool:
     t = (text or "").strip().lower()
     triggers = ["how much", "how many", "price", "cost", "mileage", "mpg", "km", "mph", "temperature", "wind", "speed", "pressure", "mm", "inches"]
     return any(x in t for x in triggers)
 
-
-def _safe_openai_text(prompt: str, model: str = "gpt-4.1-mini") -> str:
-    try:
-        resp = client.responses.create(model=model, input=prompt)
-        if hasattr(resp, "output_text") and resp.output_text:
-            return resp.output_text.strip()
-        try:
-            return resp.output[0].content[0].text.strip()  # type: ignore
-        except Exception:
-            return str(resp).strip()
-    except Exception:
-        try:
-            cc = client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.2,
-            )
-            return (cc.choices[0].message.content or "").strip()
-        except Exception as e:
-            return f"(General knowledge temporarily unavailable: {e})"
-
-
-def detect_doc_type_from_meta(meta: List[Dict[str, Any]]) -> str:
-    if not meta:
-        return "unknown"
-
-    sample = meta[:DOC_CLASSIFY_PASSAGES]
-    sample_text = "\n\n".join(
-        f"[{m.get('filename','?')} p.{m.get('page','?')}] {str(m.get('text',''))[:400]}"
-        for m in sample
-    )
-
+def answer_general_knowledge(query: str) -> str:
     prompt = (
-        "Classify the primary document type from the excerpted passages.\n"
-        "Return EXACTLY one label from this list:\n"
-        "- syllabus\n"
-        "- policy\n"
-        "- technical_manual\n"
-        "- automotive\n"
-        "- weather\n"
-        "- finance\n"
-        "- academic_paper\n"
-        "- other\n\n"
-        "Rules:\n"
-        "- Choose the single best label.\n"
-        "- Output ONLY the label.\n\n"
-        f"Passages:\n{sample_text}"
+        "Answer the user question briefly and helpfully.\n"
+        "If the question could be location/time dependent, say so.\n"
+        "Do NOT mention PDFs.\n\n"
+        f"Question: {query}"
     )
+    try:
+        resp = client.responses.create(model="gpt-4.1-mini", input=prompt)
+        ans = (resp.output_text or "").strip()
+    except Exception as e:
+        ans = f"(General knowledge temporarily unavailable: {e})"
+    return f"**General knowledge (not from your PDFs):**\n\n{ans}"
 
-    label = _safe_openai_text(prompt).strip().lower()
-    allowed = {"syllabus", "policy", "technical_manual", "automotive", "weather", "finance", "academic_paper", "other"}
-    return label if label in allowed else "other"
+def doc_mode_hint(doc_type: str) -> str:
+    mapping = {
+        "syllabus": "Detected type: **Syllabus**",
+        "policy": "Detected type: **Policy**",
+        "technical_manual": "Detected type: **Technical manual**",
+        "automotive": "Detected type: **Automotive / vehicle**",
+        "weather": "Detected type: **Weather / meteorological**",
+        "finance": "Detected type: **Finance / numbers**",
+        "academic_paper": "Detected type: **Academic paper**",
+        "other": "Detected type: **Other**",
+        "unknown": "Detected type: **Unknown**",
+    }
+    return mapping.get(doc_type, "Detected type: **Other**")
 
-
+# -------------------------------------------------
+# Extractors (from your original + safe)
+# -------------------------------------------------
 def _labels_for_query(query: str) -> Tuple[List[str], List[str]]:
     q = (query or "").lower()
 
@@ -173,7 +160,6 @@ def _labels_for_query(query: str) -> Tuple[List[str], List[str]]:
     ]
 
     return targets, stops
-
 
 def extract_labeled_field_from_hits(query: str, hits: List[Dict[str, Any]]) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
     targets, stops = _labels_for_query(query)
@@ -224,7 +210,6 @@ def extract_labeled_field_from_hits(query: str, hits: List[Dict[str, Any]]) -> T
             return (value if value else None), h
 
     return None, None
-
 
 def extract_teaching_team(hits: List[Dict[str, Any]]) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
     def find(label_variants: List[str]) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
@@ -278,46 +263,6 @@ def extract_teaching_team(hits: List[Dict[str, Any]]) -> Tuple[Optional[str], Op
 
     return "\n".join(parts), best_hit
 
-
-def extract_numbers_table(hits: List[Dict[str, Any]], max_rows: int = 12) -> List[Dict[str, str]]:
-    rows: List[Dict[str, str]] = []
-    num_re = re.compile(r"(-?\d+(?:\.\d+)?)")
-    unit_re = re.compile(r"\b(mph|km/h|kph|km|mi|mpg|°c|°f|c|f|kts|kt|knots|mb|hpa|psi|bar|mm|cm|in|inch|inches|%|\$)\b", re.IGNORECASE)
-
-    for h in hits:
-        text = (h.get("text") or "").strip()
-        if not text:
-            continue
-
-        for line in text.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-
-            nums = num_re.findall(line)
-            if not nums:
-                continue
-
-            unit = ""
-            um = unit_re.search(line)
-            if um:
-                unit = um.group(0)
-
-            val = ", ".join(nums[:2])
-
-            rows.append({
-                "Value(s)": val,
-                "Unit": unit,
-                "Context": (line[:160] + ("…" if len(line) > 160 else "")),
-                "Source": f"{h.get('filename','?')} p.{h.get('page','?')}"
-            })
-
-            if len(rows) >= max_rows:
-                return rows
-
-    return rows
-
-
 def extract_bulleted_list(hits: List[Dict[str, Any]], max_items: int = 10) -> List[str]:
     items: List[str] = []
     for h in hits:
@@ -333,7 +278,7 @@ def extract_bulleted_list(hits: List[Dict[str, Any]], max_items: int = 10) -> Li
             if s.startswith(("-", "•", "*")) or re.match(r"^\d+[\.\)]\s+", s):
                 cleaned = re.sub(r"^\d+[\.\)]\s+", "", s).lstrip("-•* ").strip()
                 cleaned = re.sub(r"\s{2,}", " ", cleaned)
-                if 4 <= len(cleaned) <= 140:
+                if 4 <= len(cleaned) <= 160:
                     items.append(cleaned)
 
             if len(items) >= max_items:
@@ -341,136 +286,92 @@ def extract_bulleted_list(hits: List[Dict[str, Any]], max_items: int = 10) -> Li
 
     return items
 
-
-def _normalize(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip().lower())
-
-
-def extract_single_numeric_answer(query: str, hits: List[Dict[str, Any]]) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
-    """
-    Doc-agnostic single-value extraction:
-    - Find best matching line that mentions the user concept (wind speed, mpg, pressure, etc.)
-    - Extract number + unit from that line
-    """
-    q = _normalize(query)
-
-    tokens = [t for t in re.findall(r"[a-z]+", q) if t not in {"the", "a", "an", "of", "is", "what", "tell", "me", "about"}]
-    target_terms: List[str] = []
-
-    for i in range(len(tokens) - 1):
-        target_terms.append(tokens[i] + " " + tokens[i + 1])
-
-    target_terms.extend(tokens[:6])
-
-    seen = set()
-    target_terms = [t for t in target_terms if not (t in seen or seen.add(t))]
-
-    num_re = re.compile(r"(-?\d+(?:\.\d+)?)")
-    unit_re = re.compile(
-        r"\b(mph|km/h|kph|km|mi|mpg|°c|°f|c|f|kts|kt|knots|mb|hpa|psi|bar|mm|cm|in|inch|inches|%|\$)\b",
-        re.IGNORECASE,
-    )
-
-    best_value: Optional[str] = None
-    best_hit: Optional[Dict[str, Any]] = None
-    best_score = -1
-
-    for h in hits:
-        text = (h.get("text") or "").strip()
-        if not text:
-            continue
-
-        for line in text.splitlines():
-            l = line.strip()
-            if not l:
-                continue
-
-            ln = _normalize(l)
-
-            nums = num_re.findall(ln)
-            if not nums:
-                continue
-
-            term_score = 0
-            for t in target_terms:
-                if t and t in ln:
-                    term_score += min(6, 1 + len(t.split()))
-
-            unit = ""
-            um = unit_re.search(ln)
-            if um:
-                unit = um.group(0)
-
-            score = term_score + (2 if unit else 0)
-
-            if score > best_score:
-                val = ", ".join(nums[:2])
-                best_value = f"{val} {unit}".strip()
-                best_hit = h
-                best_score = score
-
-    if best_value is None or best_score < 2:
-        return None, None
-
-    return best_value, best_hit
-
-
-def answer_general_knowledge(query: str) -> str:
-    prompt = (
-        "Answer the user question briefly and helpfully.\n"
-        "If the question could be location/time dependent, say so.\n"
-        "Do NOT mention PDFs. Do NOT fabricate citations.\n\n"
-        f"Question: {query}"
-    )
-    ans = _safe_openai_text(prompt)
-    return f"**General knowledge (not from your PDFs):**\n\n{ans}"
-
-
-def doc_mode_hint(doc_type: str) -> str:
-    mapping = {
-        "syllabus": "Detected type: **Syllabus**",
-        "policy": "Detected type: **Policy**",
-        "technical_manual": "Detected type: **Technical manual**",
-        "automotive": "Detected type: **Automotive / vehicle**",
-        "weather": "Detected type: **Weather / meteorological**",
-        "finance": "Detected type: **Finance / numbers**",
-        "academic_paper": "Detected type: **Academic paper**",
-        "other": "Detected type: **Other**",
-        "unknown": "Detected type: **Unknown**",
-    }
-    return mapping.get(doc_type, "Detected type: **Other**")
+# -------------------------------------------------
+# Confidence heuristic
+# -------------------------------------------------
+def confident_enough(hits: List[Dict[str, Any]], min_conf: float) -> bool:
+    if not hits:
+        return False
+    top = float(hits[0].get("score", 0.0))
+    second = float(hits[1].get("score", 0.0)) if len(hits) > 1 else 0.0
+    margin = top - second
+    if margin < 0.03 and top < (min_conf + 0.05):
+        return False
+    return top >= min_conf
 
 # -------------------------------------------------
-# Sidebar — Knowledge Base (Clear Chat at bottom)
+# Sidebar
 # -------------------------------------------------
 with st.sidebar:
     st.header("Knowledge Base")
     st.caption("Upload PDFs. Veris answers from these documents first.")
 
+    st.session_state.store_dir = st.text_input(
+        "Store folder (for persistence)",
+        value=st.session_state.store_dir,
+        help="Veris will save/load indexes here so you don't re-index every time.",
+    )
+
     files = st.file_uploader("Upload PDFs", type=["pdf"], accept_multiple_files=True)
 
-    if st.button("Index documents", type="primary", use_container_width=True):
+    colA, colB = st.columns(2)
+    with colA:
+        do_index = st.button("Index / Update", type="primary", use_container_width=True)
+    with colB:
+        do_load = st.button("Load from disk", use_container_width=True)
+
+    if do_load:
+        try:
+            idx, meta, kb = load_store(st.session_state.store_dir)
+            st.session_state.index = idx
+            st.session_state.meta = meta
+            st.session_state.indexed = True
+            st.session_state.doc_names = sorted({m.get("filename", "?") for m in meta})
+            st.session_state.active_docs = list(st.session_state.doc_names)
+            st.session_state.kb_fingerprints = kb.get("fingerprints", [])
+            st.session_state.doc_type = detect_doc_type_from_meta(meta[:DOC_CLASSIFY_PASSAGES])
+            st.success(f"Loaded store from {st.session_state.store_dir}")
+        except Exception as e:
+            st.error(f"Load failed: {e}")
+
+    if do_index:
         if not files:
             st.warning("Upload at least one PDF.")
         else:
-            passages: List[Dict[str, Any]] = []
+            passages: List[Passage] = []
             st.session_state.doc_names = [f.name for f in files]
+            fingerprints: List[str] = []
 
-            with st.spinner("Indexing documents..."):
+            with st.spinner("Reading PDFs..."):
                 for f in files:
                     pdf_bytes = f.read()
+                    fingerprints.append(sha256_bytes(pdf_bytes))
                     passages.extend(pdf_bytes_to_passages(pdf_bytes, f.name))
 
             if not passages:
                 st.error("No text could be extracted from the PDFs.")
             else:
-                st.session_state.index, st.session_state.meta = build_store(passages)
+                with st.spinner("Building index (cached embeddings + hybrid prep)..."):
+                    idx, meta = build_store(passages, store_dir=st.session_state.store_dir)
+
+                st.session_state.index = idx
+                st.session_state.meta = meta
                 st.session_state.indexed = True
+                st.session_state.kb_fingerprints = fingerprints
 
                 with st.spinner("Detecting document type..."):
-                    st.session_state.doc_type = detect_doc_type_from_meta(st.session_state.meta)
+                    st.session_state.doc_type = detect_doc_type_from_meta(st.session_state.meta[:DOC_CLASSIFY_PASSAGES])
 
-                st.success(f"Indexed {len(files)} document(s).")
+                with st.spinner("Saving store..."):
+                    save_store(
+                        st.session_state.store_dir,
+                        st.session_state.index,
+                        st.session_state.meta,
+                        kb_info={"fingerprints": fingerprints, "doc_names": st.session_state.doc_names, "saved_at": time.time()},
+                    )
+
+                st.session_state.active_docs = list(st.session_state.doc_names)
+                st.success(f"Indexed {len(files)} document(s) and saved store.")
 
     st.divider()
 
@@ -479,17 +380,33 @@ with st.sidebar:
         st.caption(doc_mode_hint(st.session_state.doc_type))
         if st.session_state.doc_names:
             st.caption("Active documents:")
-            for name in st.session_state.doc_names:
+            st.session_state.active_docs = st.multiselect(
+                "Search scope",
+                options=st.session_state.doc_names,
+                default=st.session_state.active_docs if st.session_state.active_docs else st.session_state.doc_names,
+                help="Restrict searches to selected PDFs.",
+            )
+            for name in st.session_state.active_docs:
                 st.write(f"✅ {name}")
     else:
         st.info("Status: Not indexed")
 
     st.caption("Veris cites sources when answering from documents.")
-
     st.markdown("---")
+
     if st.button("Clear chat", use_container_width=True):
         st.session_state.chat = []
         st.rerun()
+
+    if st.session_state.chat:
+        export = {"chat": st.session_state.chat, "doc_names": st.session_state.doc_names, "active_docs": st.session_state.active_docs}
+        st.download_button(
+            "Download chat (JSON)",
+            data=json.dumps(export, indent=2),
+            file_name="veris_chat.json",
+            mime="application/json",
+            use_container_width=True,
+        )
 
 # -------------------------------------------------
 # Chat History
@@ -511,10 +428,10 @@ if query:
     with st.chat_message("assistant"):
         if is_greeting(query):
             if st.session_state.indexed:
-                docs = ", ".join(st.session_state.doc_names) if st.session_state.doc_names else "your indexed documents"
+                docs = ", ".join(st.session_state.active_docs) if st.session_state.active_docs else "your indexed documents"
                 reply = f"Hi 👋\n\nAsk me anything about **{docs}** — I’ll cite sources when it’s from your PDFs."
             else:
-                reply = "Hi 👋\n\nUpload a PDF and click **Index documents** to get started."
+                reply = "Hi 👋\n\nUpload a PDF and click **Index / Update** to get started."
             st.markdown(reply)
             st.session_state.chat.append({"role": "assistant", "content": reply})
 
@@ -524,13 +441,22 @@ if query:
             st.session_state.chat.append({"role": "assistant", "content": reply})
 
         else:
-            with st.spinner("Searching documents..."):
-                hits_all = search(st.session_state.index, st.session_state.meta, query, k=RETRIEVE_K)
-
-            top_score = hits_all[0]["score"] if hits_all else 0.0
-            effective_conf = ENTITY_CONF if (is_entity_question(query) or looks_like_numbers_request(query)) else BASE_CONF
+            with st.spinner("Searching documents (hybrid + rerank)..."):
+                hits_all = search_hybrid(
+                    index=st.session_state.index,
+                    meta=st.session_state.meta,
+                    query=query,
+                    vec_k=VEC_K,
+                    bm25_k=BM25_K,
+                    final_k=FINAL_K,
+                    rerank_k=RERANK_K,
+                    restrict_filenames=st.session_state.active_docs if st.session_state.active_docs else None,
+                )
 
             ql = query.strip().lower()
+            is_entity = is_entity_question(query) or any(x in ql for x in ["ta", "teaching assistant", "grader", "instructor", "professor", "email", "phone", "office hours"])
+            is_numbers = looks_like_numbers_request(query)
+            min_conf = ENTITY_MIN_CONF if (is_entity or is_numbers) else BASE_MIN_CONF
 
             if any(x in ql for x in ["teaching team", "teaching staff", "course staff", "staff list"]):
                 team, team_hit = extract_teaching_team(hits_all)
@@ -541,12 +467,12 @@ if query:
                 st.markdown(reply)
                 st.session_state.chat.append({"role": "assistant", "content": reply})
 
-            elif is_entity_question(query) or any(x in ql for x in ["ta", "teaching assistant", "grader", "instructor", "professor", "email", "phone", "office hours"]):
-                extracted, src_hit = extract_labeled_field_from_hits(query, hits_all)
+            elif is_entity:
+                extracted, src_hit = extract_labeled_field_from_hits(query, hits_all[:SHOW_K])
                 if extracted and src_hit:
                     reply = f"**Answer:** {extracted}\n\nSource: {src_hit['filename']} p.{src_hit['page']}"
                 else:
-                    if hits_all and hits_all[0]["score"] >= effective_conf:
+                    if confident_enough(hits_all, min_conf):
                         context, _ = make_context(hits_all[:SHOW_K])
                         with st.spinner("Formulating answer..."):
                             reply = answer_from_docs(query, context)
@@ -555,35 +481,8 @@ if query:
                 st.markdown(reply)
                 st.session_state.chat.append({"role": "assistant", "content": reply})
 
-            elif looks_like_numbers_request(query):
-                if hits_all and hits_all[0]["score"] >= effective_conf:
-                    single, single_hit = extract_single_numeric_answer(query, hits_all[:SHOW_K])
-
-                    if single and single_hit:
-                        reply = f"**Answer:** {single}\n\nSource: {single_hit['filename']} p.{single_hit['page']}"
-                        st.markdown(reply)
-                        st.session_state.chat.append({"role": "assistant", "content": reply})
-                    else:
-                        rows = extract_numbers_table(hits_all[:SHOW_K], max_rows=12)
-                        if rows:
-                            st.markdown("**Extracted values from your PDFs:**")
-                            st.table(rows)
-                            reply = "Ask a more specific target like: “max wind” / “wind speed at 500mb” / “mpg for model X”."
-                            st.markdown(reply)
-                            st.session_state.chat.append({"role": "assistant", "content": reply})
-                        else:
-                            context, _ = make_context(hits_all[:SHOW_K])
-                            with st.spinner("Formulating answer..."):
-                                reply = answer_from_docs(query, context)
-                            st.markdown(reply)
-                            st.session_state.chat.append({"role": "assistant", "content": reply})
-                else:
-                    reply = answer_general_knowledge(query)
-                    st.markdown(reply)
-                    st.session_state.chat.append({"role": "assistant", "content": reply})
-
             elif looks_like_list_request(query):
-                if hits_all and hits_all[0]["score"] >= effective_conf:
+                if confident_enough(hits_all, min_conf):
                     items = extract_bulleted_list(hits_all[:SHOW_K], max_items=10)
                     if items:
                         st.markdown("**From your PDFs:**")
@@ -602,7 +501,7 @@ if query:
                     st.session_state.chat.append({"role": "assistant", "content": reply})
 
             elif is_compare_request(query):
-                if hits_all and hits_all[0]["score"] >= BASE_CONF:
+                if confident_enough(hits_all, BASE_MIN_CONF):
                     context, _ = make_context(hits_all[:SHOW_K])
                     with st.spinner("Comparing using your PDFs..."):
                         reply = answer_from_docs(
@@ -615,7 +514,7 @@ if query:
                 st.session_state.chat.append({"role": "assistant", "content": reply})
 
             elif is_summary_request(query):
-                if not hits_all or hits_all[0]["score"] < SUMMARY_CONF:
+                if not confident_enough(hits_all, SUMMARY_MIN_CONF):
                     if st.session_state.doc_type == "weather":
                         reply = (
                             "This document looks like mostly structured meteorological data.\n\n"
@@ -644,7 +543,7 @@ if query:
                 st.session_state.chat.append({"role": "assistant", "content": reply})
 
             else:
-                if hits_all and hits_all[0]["score"] >= BASE_CONF:
+                if confident_enough(hits_all, min_conf):
                     context, _ = make_context(hits_all[:SHOW_K])
                     with st.spinner("Formulating answer..."):
                         reply = answer_from_docs(query, context)

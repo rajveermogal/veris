@@ -1,5 +1,7 @@
 streamlit
 openai
-pypdf
-faiss-cpu
 numpy
+faiss-cpu
+pypdf
+tiktoken
+rank_bm25
