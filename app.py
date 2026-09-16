@@ -65,12 +65,6 @@ with st.sidebar:
     else: selected=[]
     st.caption('Your documents. A little more clarity.')
 
-with st.popover('Navigation'):
-    st.caption('Veris navigation')
-    for destination in ['Chat','Documents','Help']:
-        if st.button(destination,key='fallback_'+destination,use_container_width=True):
-            st.session_state.screen=destination
-            st.rerun()
 screen=st.session_state.screen
 if screen=='Help':
     st.title('Help & settings')
