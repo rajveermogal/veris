@@ -1,5 +1,6 @@
 """Veris conversational document workspace."""
 import hashlib
+import html
 import json
 import logging
 import os
@@ -119,7 +120,10 @@ for i,msg in enumerate(st.session_state.messages):
                 for source in msg['sources']:
                     st.caption(f"{source['filename']} · Page {source['page']}")
                     if source.get('excerpts'):
-                        for quote in source['excerpts']: st.text(quote)
+                        for quote in source['excerpts']:
+                            # PDF layout newlines are not paragraph boundaries.
+                            preview=' '.join(quote.split())
+                            st.markdown('<div class="source-excerpt">'+html.escape(preview)+'</div>',unsafe_allow_html=True)
                     else: st.caption('This earlier answer has page references only. Ask again for precise excerpts.')
         if msg.get('error'): st.caption('No answer was cached. You can submit the question again.')
 

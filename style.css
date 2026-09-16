@@ -22,7 +22,9 @@ button:disabled p,button:disabled span{color:#62695f!important;}
 .message-role{display:block;font-size:11px;font-weight:650;letter-spacing:.04em;color:#505f56;margin-bottom:6px;}
 [data-testid="stChatMessage"] [data-testid="stExpander"]{background:transparent!important;}
 [data-testid="stChatMessageAvatarAssistant"],[data-testid="stChatMessageAvatarUser"]{display:none;}
-[data-testid="stChatMessageContent"]{min-width:0;overflow-wrap:anywhere;color:#242829;}
+[data-testid="stChatMessageContent"]{flex:1 1 0%;width:100%;min-width:0;overflow-wrap:anywhere;color:#242829;}
+.source-excerpt{display:block;width:100%;white-space:normal;word-break:normal;overflow-wrap:break-word;font-family:inherit;font-size:14px;line-height:1.65;color:#303a34;margin:8px 0 16px;}
+[data-testid="stChatMessageContent"] [data-testid="stExpander"]{width:100%;min-width:0;}
 [data-testid="stChatMessageContent"] p{font-size:16px;line-height:1.7;}
 [data-testid="stCaptionContainer"],[data-testid="stCaptionContainer"] p{color:#59645c!important;}
 [data-testid="stChatInput"],textarea,input{background:#eeeee8!important;color:#242829!important;border-color:#c5ccc0!important;}
