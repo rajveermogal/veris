@@ -1,6 +1,7 @@
 """Veris conversational document workspace."""
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import streamlit as st
@@ -11,9 +12,9 @@ st.set_page_config(page_title='Veris', layout='centered', initial_sidebar_state=
 st.markdown('<style>'+Path(__file__).with_name('style.css').read_text()+'</style>', unsafe_allow_html=True)
 for k,v in dict(corpus=None, messages=[], cache={}, generation=0, screen='Chat', calls=0).items():
     if k not in st.session_state: st.session_state[k]=v
-if st.session_state.get('citation_version') != 2:
+if st.session_state.get('citation_version') != 3:
     st.session_state.cache={}
-    st.session_state.citation_version=2
+    st.session_state.citation_version=3
 
 def replace(candidate):
     st.session_state.corpus=candidate
@@ -67,7 +68,7 @@ if screen=='Help':
         st.write('Connected to OpenAI.' if os.getenv('OPENAI_API_KEY') else 'Add OPENAI_API_KEY in your Streamlit app secrets to enable conversational answers.')
         st.caption('Uploads and retrieval use no model calls. Each new uncached answer uses at most one compact model request. Recent conversation is limited to three turns. Repeating the same request with the same context reuses its answer.')
         st.write(f'Model requests attempted this session: {st.session_state.calls}')
-        st.caption('Default model: gpt-4.1-nano. A VERIS_CHAT_MODEL server setting can override it. Provider charges apply; this is not a spending cap across users.')
+        st.caption('Default model: gpt-4.1-mini. A VERIS_CHAT_MODEL server setting can override it. Provider charges apply; this is not a spending cap across users.')
     with st.expander('Privacy'):
         st.write('Documents are processed on this hosting server. When you ask a question, selected source text, the question and up to three recent conversation turns are sent to OpenAI. Small documents may be included in full. Provider and hosting retention policies apply.')
         st.write('The workspace and answer cache are held in your session. PDF extraction uses temporary files removed after processing. Clearing the workspace removes app references, but cannot guarantee erasure from hosting memory, logs or provider systems. Upload only documents you have permission to process.')
@@ -134,7 +135,7 @@ if question:
     with st.chat_message('assistant'), st.spinner('Reading your documents…'):
         st.markdown('<span class="message-role assistant-role">Veris</span>',unsafe_allow_html=True)
         try:
-            if previous and previous['question']==question and previous.get('citation_version')==2:
+            if previous and previous['question']==question and previous.get('citation_version')==3:
                 result=dict(answer=previous['answer'],sources=[s['id'] for s in previous['sources']],excerpts={s['id']:s['excerpts'] for s in previous['sources']},status='answered'); evidence=previous['sources']
             elif key in st.session_state.cache: result=st.session_state.cache[key]
             else:
@@ -143,9 +144,22 @@ if question:
                 st.session_state.cache[key]=result
                 if len(st.session_state.cache)>50: del st.session_state.cache[next(iter(st.session_state.cache))]
             sources=[dict(id=h['id'],filename=h['filename'],page=h['page'],excerpts=result.get('excerpts',{}).get(h['id'],[])) for h in evidence if h['id'] in result['sources']]
-            message=dict(question=question,answer=result['answer'],sources=sources,scope=sorted(selected),citation_version=2)
-        except Exception:
-            message=dict(question=question,answer='I couldn’t complete that answer. Please try again. If it keeps happening, check your API connection and quota in Help & settings.',sources=[],error=True,scope=sorted(selected))
+            message=dict(question=question,answer=result['answer'],sources=sources,scope=sorted(selected),citation_version=3)
+        except Exception as exc:
+            # Log only diagnostic metadata, never prompts, files or credentials.
+            status=getattr(exc,'status_code',None)
+            logging.getLogger('veris').warning('Answer failed: type=%s status=%s',type(exc).__name__,status)
+            if isinstance(exc,ValueError):
+                error_text='I could not produce a complete answer with valid source references. Please try again.'
+            elif status==401:
+                error_text='The API key was rejected. Check the connection in your app secrets.'
+            elif status==429:
+                error_text='The answer service reached a usage or rate limit. Please check the provider quota or try later.'
+            elif 'Timeout' in type(exc).__name__:
+                error_text='The answer service took too long. Please try again.'
+            else:
+                error_text='The answer service could not complete the request. Please try again. The server logs contain the error type.'
+            message=dict(question=question,answer=error_text,sources=[],error=True,scope=sorted(selected))
     st.session_state.messages.append(message)
     st.session_state.messages=st.session_state.messages[-30:]
     st.rerun()

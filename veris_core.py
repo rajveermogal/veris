@@ -21,7 +21,7 @@ MAX_TOTAL_BYTES = 40 * 1024 * 1024
 MAX_FILES = 10
 MAX_CHUNKS = 4000
 EMBED_MODEL = "text-embedding-3-small"
-CHAT_MODEL = os.getenv("VERIS_CHAT_MODEL", "gpt-4.1-nano")
+CHAT_MODEL = os.getenv("VERIS_CHAT_MODEL", "gpt-4.1-mini")
 STOP = set("a an the is are was were be to of in on at for and or with what which who how does do can me my please tell about from this that it by as".split())
 
 
