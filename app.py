@@ -1,563 +1,202 @@
-# app.py
+"""Veris document workspace. Run: streamlit run app.py"""
+import html
 import os
-import re
-import json
-import time
+from pathlib import Path
 import streamlit as st
-from typing import Optional, Tuple, List, Dict, Any
+from veris_core import DocumentError, answer_from_docs, build_corpus, demo_corpus, embed, retrieve
 
-from openai import OpenAI
+st.set_page_config(page_title="Veris | Document workspace", layout="wide")
+st.markdown('<style>' + Path(__file__).with_name('style.css').read_text() + '</style>', unsafe_allow_html=True)
+for key, value in {"corpus": None, "history": [], "result": None, "generation": 0}.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
 
-from veris_core import (
-    Passage,
-    pdf_bytes_to_passages,
-    build_store,
-    load_store,
-    save_store,
-    search_hybrid,
-    make_context,
-    answer_from_docs,
-    detect_doc_type_from_meta,
-    sha256_bytes,
-)
 
-# -------------------------------------------------
-# Branding
-# -------------------------------------------------
-st.set_page_config(page_title="Veris", page_icon="🐦‍🔥", layout="wide")
-st.title("🐦‍🔥 Veris")
-st.caption("Understands your documents, so you don’t have to.")
+def replace_workspace(candidate):
+    st.session_state.corpus = candidate
+    st.session_state.history = []
+    st.session_state.result = None
+    st.session_state.generation += 1
 
-if not os.getenv("OPENAI_API_KEY"):
-    st.error("OPENAI_API_KEY not set. Set it and restart the terminal.")
-    st.stop()
 
-client = OpenAI()
-
-# -------------------------------------------------
-# Constants
-# -------------------------------------------------
-SHOW_K = 6
-VEC_K = 28
-BM25_K = 28
-FINAL_K = 24
-RERANK_K = 12
-
-BASE_MIN_CONF = 0.22
-SUMMARY_MIN_CONF = 0.18
-ENTITY_MIN_CONF = 0.12
-
-DOC_CLASSIFY_PASSAGES = 16
-
-# -------------------------------------------------
-# Session State
-# -------------------------------------------------
-if "index" not in st.session_state:
-    st.session_state.index = None
-if "meta" not in st.session_state:
-    st.session_state.meta = []
-if "chat" not in st.session_state:
-    st.session_state.chat = []
-if "indexed" not in st.session_state:
-    st.session_state.indexed = False
-if "doc_names" not in st.session_state:
-    st.session_state.doc_names = []
-if "doc_type" not in st.session_state:
-    st.session_state.doc_type = "unknown"
-if "store_dir" not in st.session_state:
-    st.session_state.store_dir = "./veris_store"
-if "active_docs" not in st.session_state:
-    st.session_state.active_docs = []
-if "kb_fingerprints" not in st.session_state:
-    st.session_state.kb_fingerprints = []
-
-# -------------------------------------------------
-# Intent helpers
-# -------------------------------------------------
-def is_greeting(text: str) -> bool:
-    t = (text or "").strip().lower()
-    return t in {"hi", "hello", "hey", "yo", "good morning", "good afternoon", "good evening"}
-
-def is_summary_request(text: str) -> bool:
-    t = (text or "").strip().lower()
-    return any(x in t for x in ["summary", "summarize", "important points", "key points", "highlights", "important data"])
-
-def is_compare_request(text: str) -> bool:
-    t = (text or "").strip().lower()
-    return ("compare" in t) or (" vs " in t) or ("versus" in t)
-
-def is_entity_question(text: str) -> bool:
-    t = (text or "").strip().lower()
-    return any(x in t for x in ["who is", "who's", "who’s", "name of", "email of", "contact for", "phone", "address"])
-
-def looks_like_list_request(text: str) -> bool:
-    t = (text or "").strip().lower()
-    triggers = ["list", "what are the", "which are", "types of", "models", "parts", "features", "requirements", "steps"]
-    return any(x in t for x in triggers)
-
-def looks_like_numbers_request(text: str) -> bool:
-    t = (text or "").strip().lower()
-    triggers = ["how much", "how many", "price", "cost", "mileage", "mpg", "km", "mph", "temperature", "wind", "speed", "pressure", "mm", "inches"]
-    return any(x in t for x in triggers)
-
-def answer_general_knowledge(query: str) -> str:
-    prompt = (
-        "Answer the user question briefly and helpfully.\n"
-        "If the question could be location/time dependent, say so.\n"
-        "Do NOT mention PDFs.\n\n"
-        f"Question: {query}"
-    )
-    try:
-        resp = client.responses.create(model="gpt-4.1-mini", input=prompt)
-        ans = (resp.output_text or "").strip()
-    except Exception as e:
-        ans = f"(General knowledge temporarily unavailable: {e})"
-    return f"**General knowledge (not from your PDFs):**\n\n{ans}"
-
-def doc_mode_hint(doc_type: str) -> str:
-    mapping = {
-        "syllabus": "Detected type: **Syllabus**",
-        "policy": "Detected type: **Policy**",
-        "technical_manual": "Detected type: **Technical manual**",
-        "automotive": "Detected type: **Automotive / vehicle**",
-        "weather": "Detected type: **Weather / meteorological**",
-        "finance": "Detected type: **Finance / numbers**",
-        "academic_paper": "Detected type: **Academic paper**",
-        "other": "Detected type: **Other**",
-        "unknown": "Detected type: **Unknown**",
-    }
-    return mapping.get(doc_type, "Detected type: **Other**")
-
-# -------------------------------------------------
-# Extractors (from your original + safe)
-# -------------------------------------------------
-def _labels_for_query(query: str) -> Tuple[List[str], List[str]]:
-    q = (query or "").lower()
-
-    if any(x in q for x in ["ta", "teaching assistant"]):
-        targets = ["Teaching Assistant", "TA"]
-    elif any(x in q for x in ["professor", "instructor", "teacher"]):
-        targets = ["Instructor", "Professor"]
-    elif "grader" in q:
-        targets = ["Grader"]
-    elif any(x in q for x in ["email", "e-mail"]):
-        targets = ["Email", "E-mail"]
-    elif "phone" in q:
-        targets = ["Phone", "Telephone"]
-    elif "office hours" in q:
-        targets = ["Office Hours"]
-    elif "website" in q:
-        targets = ["Website", "Class Website", "Course Website"]
-    else:
-        targets = []
-
-    stops = [
-        "Instructor", "Professor", "Teaching Assistant", "TA", "Grader",
-        "Office", "Email", "E-mail", "Phone", "Telephone",
-        "Website", "Class Website", "Course Website",
-        "Course Administrator", "Administrator",
-        "Office Hours", "Location", "Zoom", "Canvas", "Slack"
-    ]
-
-    return targets, stops
-
-def extract_labeled_field_from_hits(query: str, hits: List[Dict[str, Any]]) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
-    targets, stops = _labels_for_query(query)
-    if not targets:
-        return None, None
-
-    target_re = re.compile(
-        r"(?:" + "|".join(re.escape(t) for t in targets) + r")\s*[:\-]\s*(.+)",
-        flags=re.IGNORECASE
-    )
-
-    stop_re = re.compile(
-        r"\b(?:" + "|".join(re.escape(s) for s in stops) + r")\s*[:\-]",
-        flags=re.IGNORECASE
-    )
-
-    email_re = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", flags=re.IGNORECASE)
-
-    for h in hits:
-        text = (h.get("text") or "").strip()
-        if not text:
-            continue
-
-        for line in text.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-
-            m = target_re.search(line)
-            if not m:
-                continue
-
-            value = m.group(1).strip()
-            cut = stop_re.search(value)
-            if cut:
-                value = value[:cut.start()].strip()
-
-            value = re.sub(r"\s{2,}", " ", value).strip(" •-–—:;,. ")
-
-            em = email_re.search(value)
-            if em:
-                email = em.group(0)
-                name_part = value[:em.start()].strip(" ,;:-–—")
-                if name_part:
-                    return f"{name_part} — {email}", h
-                return email, h
-
-            return (value if value else None), h
-
-    return None, None
-
-def extract_teaching_team(hits: List[Dict[str, Any]]) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
-    def find(label_variants: List[str]) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
-        pat = re.compile(r"(?:" + "|".join(re.escape(x) for x in label_variants) + r")\s*[:\-]\s*(.+)", re.IGNORECASE)
-        stop_pat = re.compile(
-            r"\b(?:Instructor|Professor|Teaching Assistant|TA|Grader|Office|Email|E-mail|Phone|Website|Office Hours|Location)\s*[:\-]",
-            re.IGNORECASE
-        )
-        email_pat = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
-
-        for h in hits:
-            for line in (h.get("text") or "").splitlines():
-                line = line.strip()
-                m = pat.search(line)
-                if not m:
-                    continue
-                value = m.group(1).strip()
-                cut = stop_pat.search(value)
-                if cut:
-                    value = value[:cut.start()].strip()
-                value = re.sub(r"\s{2,}", " ", value).strip(" •-–—:;,. ")
-
-                em = email_pat.search(value)
-                if em:
-                    email = em.group(0)
-                    name_part = value[:em.start()].strip(" ,;:-–—")
-                    if name_part:
-                        return f"{name_part} — {email}", h
-                    return email, h
-
-                return value, h
-
-        return None, None
-
-    prof, prof_hit = find(["Instructor", "Professor"])
-    ta, ta_hit = find(["Teaching Assistant", "TA"])
-    grader, grader_hit = find(["Grader"])
-
-    parts = []
-    best_hit = prof_hit or ta_hit or grader_hit
-
-    if prof:
-        parts.append(f"**Instructor/Professor:** {prof}")
-    if ta:
-        parts.append(f"**Teaching Assistant:** {ta}")
-    if grader:
-        parts.append(f"**Grader:** {grader}")
-
-    if not parts:
-        return None, None
-
-    return "\n".join(parts), best_hit
-
-def extract_bulleted_list(hits: List[Dict[str, Any]], max_items: int = 10) -> List[str]:
-    items: List[str] = []
-    for h in hits:
-        text = (h.get("text") or "").strip()
-        if not text:
-            continue
-
-        for line in text.splitlines():
-            s = line.strip()
-            if not s:
-                continue
-
-            if s.startswith(("-", "•", "*")) or re.match(r"^\d+[\.\)]\s+", s):
-                cleaned = re.sub(r"^\d+[\.\)]\s+", "", s).lstrip("-•* ").strip()
-                cleaned = re.sub(r"\s{2,}", " ", cleaned)
-                if 4 <= len(cleaned) <= 160:
-                    items.append(cleaned)
-
-            if len(items) >= max_items:
-                return items
-
-    return items
-
-# -------------------------------------------------
-# Confidence heuristic
-# -------------------------------------------------
-def confident_enough(hits: List[Dict[str, Any]], min_conf: float) -> bool:
-    if not hits:
-        return False
-    top = float(hits[0].get("score", 0.0))
-    second = float(hits[1].get("score", 0.0)) if len(hits) > 1 else 0.0
-    margin = top - second
-    if margin < 0.03 and top < (min_conf + 0.05):
-        return False
-    return top >= min_conf
-
-# -------------------------------------------------
-# Sidebar
-# -------------------------------------------------
-with st.sidebar:
-    st.header("Knowledge Base")
-    st.caption("Upload PDFs. Veris answers from these documents first.")
-
-    st.session_state.store_dir = st.text_input(
-        "Store folder (for persistence)",
-        value=st.session_state.store_dir,
-        help="Veris will save/load indexes here so you don't re-index every time.",
-    )
-
-    files = st.file_uploader("Upload PDFs", type=["pdf"], accept_multiple_files=True)
-
-    colA, colB = st.columns(2)
-    with colA:
-        do_index = st.button("Index / Update", type="primary", use_container_width=True)
-    with colB:
-        do_load = st.button("Load from disk", use_container_width=True)
-
-    if do_load:
+def submit(question, selected, assisted):
+    corpus = st.session_state.corpus
+    vector, notice = None, ""
+    if assisted and corpus.vectors is not None:
         try:
-            idx, meta, kb = load_store(st.session_state.store_dir)
-            st.session_state.index = idx
-            st.session_state.meta = meta
-            st.session_state.indexed = True
-            st.session_state.doc_names = sorted({m.get("filename", "?") for m in meta})
-            st.session_state.active_docs = list(st.session_state.doc_names)
-            st.session_state.kb_fingerprints = kb.get("fingerprints", [])
-            st.session_state.doc_type = detect_doc_type_from_meta(meta[:DOC_CLASSIFY_PASSAGES])
-            st.success(f"Loaded store from {st.session_state.store_dir}")
-        except Exception as e:
-            st.error(f"Load failed: {e}")
+            vector = embed([question])[0]
+        except Exception:
+            notice = "Semantic search is unavailable. Results below use local text search."
+    hits = retrieve(corpus, question, selected, query_vector=vector)
+    answer = ""
+    if assisted and hits:
+        try:
+            answer = answer_from_docs(question, hits)
+        except Exception:
+            notice = "An assisted answer is unavailable. Read the matching source passages below."
+    result = dict(question=question, answer=answer, hits=hits, notice=notice, scope=list(selected))
+    st.session_state.result = result
+    st.session_state.history.append(result)
+    st.session_state.history = st.session_state.history[-30:]
 
-    if do_index:
-        if not files:
-            st.warning("Upload at least one PDF.")
-        else:
-            passages: List[Passage] = []
-            st.session_state.doc_names = [f.name for f in files]
-            fingerprints: List[str] = []
 
-            with st.spinner("Reading PDFs..."):
-                for f in files:
-                    pdf_bytes = f.read()
-                    fingerprints.append(sha256_bytes(pdf_bytes))
-                    passages.extend(pdf_bytes_to_passages(pdf_bytes, f.name))
-
-            if not passages:
-                st.error("No text could be extracted from the PDFs.")
-            else:
-                with st.spinner("Building index (cached embeddings + hybrid prep)..."):
-                    idx, meta = build_store(passages, store_dir=st.session_state.store_dir)
-
-                st.session_state.index = idx
-                st.session_state.meta = meta
-                st.session_state.indexed = True
-                st.session_state.kb_fingerprints = fingerprints
-
-                with st.spinner("Detecting document type..."):
-                    st.session_state.doc_type = detect_doc_type_from_meta(st.session_state.meta[:DOC_CLASSIFY_PASSAGES])
-
-                with st.spinner("Saving store..."):
-                    save_store(
-                        st.session_state.store_dir,
-                        st.session_state.index,
-                        st.session_state.meta,
-                        kb_info={"fingerprints": fingerprints, "doc_names": st.session_state.doc_names, "saved_at": time.time()},
-                    )
-
-                st.session_state.active_docs = list(st.session_state.doc_names)
-                st.success(f"Indexed {len(files)} document(s) and saved store.")
-
-    st.divider()
-
-    if st.session_state.indexed:
-        st.success("Status: Indexed ✅")
-        st.caption(doc_mode_hint(st.session_state.doc_type))
-        if st.session_state.doc_names:
-            st.caption("Active documents:")
-            st.session_state.active_docs = st.multiselect(
-                "Search scope",
-                options=st.session_state.doc_names,
-                default=st.session_state.active_docs if st.session_state.active_docs else st.session_state.doc_names,
-                help="Restrict searches to selected PDFs.",
-            )
-            for name in st.session_state.active_docs:
-                st.write(f"✅ {name}")
+with st.sidebar:
+    st.markdown('<div class="brand">veris.</div><div class="eyebrow">Document workspace</div>', unsafe_allow_html=True)
+    st.markdown('### Library')
+    st.caption('Up to 10 PDFs · 15 MB each · 40 MB total')
+    files = st.file_uploader('Add PDF documents', type=['pdf'], accept_multiple_files=True,
+                             key=f'uploads_{st.session_state.generation}')
+    if st.button('Index documents', type='primary', use_container_width=True, disabled=not files):
+        progress = st.progress(0, text='Preparing documents')
+        try:
+            candidate = build_corpus([(f.name, f.getvalue()) for f in files], progress.progress)
+            replace_workspace(candidate)
+            st.rerun()
+        except DocumentError as exc:
+            st.error(str(exc))
+            st.caption('Your previous workspace is still available.')
+        except Exception:
+            st.error('Indexing could not finish. Try a smaller document. Your previous workspace is still available.')
+        finally:
+            progress.empty()
+    st.caption('A new collection replaces the current one only after every PDF succeeds.')
+    corpus = st.session_state.corpus
+    if corpus:
+        names = list(corpus.documents)
+        selected = st.multiselect('Search within', names, default=names, key=f'scope_{st.session_state.generation}')
+        st.caption(f'{len(names)} documents / {len(corpus.passages)} passages')
+        for notice in corpus.notices:
+            st.caption(notice)
     else:
-        st.info("Status: Not indexed")
-
-    st.caption("Veris cites sources when answering from documents.")
-    st.markdown("---")
-
-    if st.button("Clear chat", use_container_width=True):
-        st.session_state.chat = []
-        st.rerun()
-
-    if st.session_state.chat:
-        export = {"chat": st.session_state.chat, "doc_names": st.session_state.doc_names, "active_docs": st.session_state.active_docs}
-        st.download_button(
-            "Download chat (JSON)",
-            data=json.dumps(export, indent=2),
-            file_name="veris_chat.json",
-            mime="application/json",
-            use_container_width=True,
-        )
-
-# -------------------------------------------------
-# Chat History
-# -------------------------------------------------
-for msg in st.session_state.chat:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
-
-# -------------------------------------------------
-# Chat Input
-# -------------------------------------------------
-query = st.chat_input("Ask Veris about your documents...")
-
-if query:
-    st.session_state.chat.append({"role": "user", "content": query})
-    with st.chat_message("user"):
-        st.markdown(query)
-
-    with st.chat_message("assistant"):
-        if is_greeting(query):
-            if st.session_state.indexed:
-                docs = ", ".join(st.session_state.active_docs) if st.session_state.active_docs else "your indexed documents"
-                reply = f"Hi 👋\n\nAsk me anything about **{docs}** — I’ll cite sources when it’s from your PDFs."
-            else:
-                reply = "Hi 👋\n\nUpload a PDF and click **Index / Update** to get started."
-            st.markdown(reply)
-            st.session_state.chat.append({"role": "assistant", "content": reply})
-
-        elif not st.session_state.indexed:
-            reply = answer_general_knowledge(query)
-            st.markdown(reply)
-            st.session_state.chat.append({"role": "assistant", "content": reply})
-
+        selected = []
+    st.divider()
+    has_key = bool(os.getenv('OPENAI_API_KEY'))
+    mode = st.selectbox('Answer mode', ['Source search', 'Assisted answers'])
+    assisted = mode == 'Assisted answers' and has_key
+    if mode == 'Assisted answers':
+        if not has_key:
+            st.info('Assisted answers need an OPENAI_API_KEY on the server. Source search remains available.')
         else:
-            with st.spinner("Searching documents (hybrid + rerank)..."):
-                hits_all = search_hybrid(
-                    index=st.session_state.index,
-                    meta=st.session_state.meta,
-                    query=query,
-                    vec_k=VEC_K,
-                    bm25_k=BM25_K,
-                    final_k=FINAL_K,
-                    rerank_k=RERANK_K,
-                    restrict_filenames=st.session_state.active_docs if st.session_state.active_docs else None,
-                )
+            st.caption('Questions and matching excerpts are sent to OpenAI. Verify answers against the sources.')
+    else:
+        st.caption('Search extracted text on this server. No model or API key needed.')
+    if corpus and has_key and assisted and corpus.vectors is None:
+        st.caption('Optional semantic search sends all indexed passages to OpenAI for embedding.')
+        if st.button('Enable semantic search', use_container_width=True):
+            with st.spinner('Preparing semantic search'):
+                try:
+                    vectors = embed([p.text for p in corpus.passages])
+                    corpus.vectors = vectors
+                    st.success('Semantic search is ready.')
+                except Exception:
+                    st.warning('Semantic search could not be enabled. Your local index is intact.')
+    elif corpus and corpus.vectors is not None:
+        st.caption('Semantic index available for assisted mode')
+    if st.button('Open sample workspace', use_container_width=True):
+        replace_workspace(demo_corpus())
+        st.rerun()
+    if corpus and st.button('Clear workspace', use_container_width=True):
+        replace_workspace(None)
+        st.rerun()
+    st.markdown('<div class="foot">Session workspace<br>Download useful results before leaving.</div>', unsafe_allow_html=True)
 
-            ql = query.strip().lower()
-            is_entity = is_entity_question(query) or any(x in ql for x in ["ta", "teaching assistant", "grader", "instructor", "professor", "email", "phone", "office hours"])
-            is_numbers = looks_like_numbers_request(query)
-            min_conf = ENTITY_MIN_CONF if (is_entity or is_numbers) else BASE_MIN_CONF
+st.markdown('<div class="eyebrow">Read closely. Find what matters.</div>', unsafe_allow_html=True)
+st.title('Your documents, within reach.')
+st.markdown('<div class="deck">Search the details, compare the evidence, and return to the exact page. A focused place to work with your PDFs.</div>', unsafe_allow_html=True)
+workspace, activity, privacy, terms_tab = st.tabs(['Workspace', 'Recent searches', 'Privacy', 'Terms'])
 
-            if any(x in ql for x in ["teaching team", "teaching staff", "course staff", "staff list"]):
-                team, team_hit = extract_teaching_team(hits_all)
-                if team and team_hit:
-                    reply = f"{team}\n\nSource: {team_hit['filename']} p.{team_hit['page']}"
+with workspace:
+    if not corpus:
+        st.markdown('## Start with a document')
+        st.write('Add PDFs using the library, then index them to make their text searchable. A document with selectable text works best.')
+        st.divider()
+        left, right = st.columns([3, 2], gap='large')
+        with left:
+            st.markdown('### See the workspace in use')
+            st.write('The sample event handbook includes registration times, cancellation rules, and volunteer instructions. Search its actual text and inspect the matching pages.')
+            if st.button('Try the sample handbook', type='primary'):
+                replace_workspace(demo_corpus())
+                st.rerun()
+        with right:
+            st.markdown('<div class="source-label">Sample excerpt / Page 2</div><div class="excerpt">Registration cancellations received at least seven days before the event receive a full refund.</div>', unsafe_allow_html=True)
+            st.caption('Fictional sample content. No account or API key required.')
+    else:
+        with st.form('question_form'):
+            question = st.text_input('What would you like to find?', placeholder='Ask a question or enter a phrase', max_chars=2000)
+            asked = st.form_submit_button('Find in documents', type='primary', disabled=not selected)
+        if not selected:
+            st.info('Select at least one document in the library to search.')
+        if asked and question.strip() and selected:
+            with st.spinner('Finding relevant passages'):
+                submit(question.strip(), selected, assisted)
+        result = st.session_state.result
+        if result and set(result['scope']) != set(selected):
+            st.info('Your document selection changed. Search again to refresh the results.')
+        elif result:
+            hits = result['hits']
+            left, right = st.columns([1.15, 1], gap='large')
+            with left:
+                st.markdown('### Search results')
+                st.write(result['question'])
+                if result['notice']:
+                    st.info(result['notice'])
+                if result['answer']:
+                    st.markdown(result['answer'])
+                    st.caption('Generated from excerpts. Source labels identify passages, not a guarantee of accuracy.')
+                elif not hits:
+                    st.info('No matching evidence found. Try a name, course code, or exact phrase, or include another document.')
                 else:
-                    reply = "I couldn’t find a clearly labeled staff/team section in the retrieved text."
-                st.markdown(reply)
-                st.session_state.chat.append({"role": "assistant", "content": reply})
-
-            elif is_entity:
-                extracted, src_hit = extract_labeled_field_from_hits(query, hits_all[:SHOW_K])
-                if extracted and src_hit:
-                    reply = f"**Answer:** {extracted}\n\nSource: {src_hit['filename']} p.{src_hit['page']}"
+                    st.caption('Matching passages from your selected documents.')
+                for hit in hits:
+                    st.markdown(f"**[{hit['id']}] {html.escape(hit['filename'])} · Page {hit['page']}**")
+                    st.text(hit['text'][:400] + ('…' if len(hit['text']) > 400 else ''))
+                if hits:
+                    export = '# ' + result['question'] + '\n\n' + result['answer'] + '\n\n'
+                    export += '\n\n'.join(f"[{h['id']}] {h['filename']} | Page {h['page']}\n{h['text']}" for h in hits)
+                    st.download_button('Download this result', export, file_name='veris-result.md', mime='text/markdown')
+            with right:
+                st.markdown('### Source reader')
+                if hits:
+                    hit_id = st.selectbox('Choose a source', list(range(len(hits))),
+                                          format_func=lambda i: f"[{hits[i]['id']}] {hits[i]['filename']} · Page {hits[i]['page']}")
+                    hit = hits[hit_id]
+                    st.markdown(f'<div class="source-label">{html.escape(hit["filename"])} / Page {hit["page"]}</div>', unsafe_allow_html=True)
+                    st.markdown(f'<div class="excerpt">{html.escape(hit["text"])}</div>', unsafe_allow_html=True)
+                    st.caption('Extracted passage. Verify tables and grades in the original PDF.')
+                    raw = corpus.documents[hit['filename']]
+                    if raw:
+                        st.download_button('Download original PDF', raw, file_name=hit['filename'], mime='application/pdf')
                 else:
-                    if confident_enough(hits_all, min_conf):
-                        context, _ = make_context(hits_all[:SHOW_K])
-                        with st.spinner("Formulating answer..."):
-                            reply = answer_from_docs(query, context)
-                    else:
-                        reply = answer_general_knowledge(query)
-                st.markdown(reply)
-                st.session_state.chat.append({"role": "assistant", "content": reply})
+                    st.caption('A matching passage will appear here after your next search.')
+        else:
+            st.markdown('### Ready to search')
+            st.write('Ask about a specific detail. Every result includes its document and page number.')
+            st.caption('For transcripts, start with a course name or code. PDF extraction may not preserve table columns.')
 
-            elif looks_like_list_request(query):
-                if confident_enough(hits_all, min_conf):
-                    items = extract_bulleted_list(hits_all[:SHOW_K], max_items=10)
-                    if items:
-                        st.markdown("**From your PDFs:**")
-                        for it in items:
-                            st.markdown(f"- {it}")
-                        reply = "If you want, tell me a section/page to focus on and I’ll make it more precise."
-                    else:
-                        context, _ = make_context(hits_all[:SHOW_K])
-                        with st.spinner("Formulating answer..."):
-                            reply = answer_from_docs(query, context)
-                    st.markdown(reply)
-                    st.session_state.chat.append({"role": "assistant", "content": reply})
-                else:
-                    reply = answer_general_knowledge(query)
-                    st.markdown(reply)
-                    st.session_state.chat.append({"role": "assistant", "content": reply})
+with activity:
+    st.markdown('## Recent searches')
+    st.caption('The latest 30 searches in this session. Starting a new collection clears this history.')
+    if not st.session_state.history:
+        st.write('Your searches will appear here.')
+    for result in reversed(st.session_state.history):
+        with st.expander(result['question']):
+            st.write(result['answer'] or 'Source search')
+            for hit in result['hits']:
+                st.caption(f"[{hit['id']}] {hit['filename']} · Page {hit['page']}")
+                st.text(hit['text'])
 
-            elif is_compare_request(query):
-                if confident_enough(hits_all, BASE_MIN_CONF):
-                    context, _ = make_context(hits_all[:SHOW_K])
-                    with st.spinner("Comparing using your PDFs..."):
-                        reply = answer_from_docs(
-                            "Compare the items in the question. Use only the provided context and cite sources.\n\nQuestion: " + query,
-                            context
-                        )
-                else:
-                    reply = answer_general_knowledge(query)
-                st.markdown(reply)
-                st.session_state.chat.append({"role": "assistant", "content": reply})
+with privacy:
+    st.markdown('## Privacy & data handling')
+    st.write('Veris processes uploads on the server hosting this app. Source search does not send text to a model provider. PDF bytes and extracted passages are held in the current session; extraction also uses temporary files removed after processing.')
+    st.write("Assisted answers send questions and retrieved excerpts to OpenAI. Enabling semantic search separately sends every indexed passage to OpenAI. Provider retention and the hosting operator's logging policies may still apply.")
+    st.write("This version does not write a shared document index, add analytics, or use an application database. Clear workspace removes the app's references to the collection and history. It does not guarantee immediate erasure from server memory, host backups, or provider systems.")
+    st.write('Upload only documents you are authorized to process. Use a trusted deployment with appropriate access controls for sensitive records. Ask the deployment operator about hosting, retention, and privacy requests before uploading.')
 
-            elif is_summary_request(query):
-                if not confident_enough(hits_all, SUMMARY_MIN_CONF):
-                    if st.session_state.doc_type == "weather":
-                        reply = (
-                            "This document looks like mostly structured meteorological data.\n\n"
-                            "To summarize well, tell me what you care about:\n"
-                            "- wind speed\n"
-                            "- temperature\n"
-                            "- pressure\n"
-                            "- precipitation\n"
-                            "- date range\n\n"
-                            "Or ask: “Summarize the first 3 pages.”"
-                        )
-                    else:
-                        reply = (
-                            "I can summarize, but I’m not confident I pulled the right section.\n\n"
-                            "Try:\n"
-                            "- “Summarize page 1”\n"
-                            "- “Summarize the section about X”\n"
-                            "- Or ask a specific question (e.g., “What are the requirements?”)"
-                        )
-                else:
-                    context, _ = make_context(hits_all[:SHOW_K])
-                    with st.spinner("Summarizing from your PDFs..."):
-                        reply = answer_from_docs(query, context)
-
-                st.markdown(reply)
-                st.session_state.chat.append({"role": "assistant", "content": reply})
-
-            else:
-                if confident_enough(hits_all, min_conf):
-                    context, _ = make_context(hits_all[:SHOW_K])
-                    with st.spinner("Formulating answer..."):
-                        reply = answer_from_docs(query, context)
-                else:
-                    reply = answer_general_knowledge(query)
-
-                st.markdown(reply)
-                st.session_state.chat.append({"role": "assistant", "content": reply})
-
-            if hits_all:
-                with st.expander("Sources"):
-                    for i, h in enumerate(hits_all[:SHOW_K], 1):
-                        st.markdown(f"**{i}. {h['filename']} p.{h['page']}** — score `{h['score']:.3f}`")
-                        st.write(h["text"])
+with terms_tab:
+    st.markdown('## Terms of use')
+    st.write("Use this workspace only with documents you have permission to upload and process. Do not access other users' information or disrupt the service.")
+    st.write('Search results and assisted answers can omit context or contain errors. Verify important details against the original, particularly grades, dates, amounts, and tables. This tool is not a substitute for professional advice or an official record.')
+    st.write('This self-hosted software has no service availability commitment. Sessions may expire and work may be lost. Download results you need to retain. The deployment operator is responsible for publishing additional terms, contact details, and privacy obligations that apply to their service.')
 
 st.divider()
-st.caption("© 2026 Rajveer Mogal. All rights reserved.")
+st.markdown('<div class="foot">VERIS / Document workspace · Source-first by default</div>', unsafe_allow_html=True)

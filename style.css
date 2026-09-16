@@ -1,0 +1,23 @@
+:root {color-scheme:light;}
+html,body,[data-testid="stApp"],button,input,textarea {font-family:Arial,sans-serif;}
+[data-testid="stAppViewContainer"],[data-testid="stHeader"] {background:#f3f1eb;}
+[data-testid="stSidebar"] {background:#e8e5dc;border-right:1px solid #ccc7bc;}
+.block-container {max-width:1360px;padding:2rem 2.5rem;}
+h1,h2,h3 {font-family:Georgia,serif!important;font-weight:400!important;color:#252b28;}
+h1 {font-size:3rem!important;letter-spacing:-1.5px;line-height:1.12!important;}
+h2 {font-size:1.8rem!important;} h3 {font-size:1.25rem!important;}
+p,li,label {color:#353b37;}
+button,input,textarea,[data-baseweb="select"]>div,[data-testid="stFileUploaderDropzone"],[data-testid="stExpander"] {border-radius:2px!important;box-shadow:none!important;}
+[data-testid="stButton"] button[kind="primary"],[data-testid="stFormSubmitButton"] button[kind="primary"] {background:#304b40;border-color:#304b40;color:#f3f1eb;}
+[data-testid="stButton"] button {min-height:2.6rem;}
+[data-testid="stAlert"] {border-radius:0;background:#e7e9df;color:#263c32;}
+[data-testid="stFileUploaderDropzone"] {background:#efede6;border:1px dashed #aaa79d;}
+.brand {font-family:Georgia,serif;font-size:2.15rem;letter-spacing:-1px;color:#243c31;}
+.eyebrow {font:11px Arial,sans-serif;letter-spacing:1.7px;text-transform:uppercase;color:#62695f;margin:8px 0 18px;}
+.deck {font-size:1.05rem;line-height:1.65;color:#62665e;max-width:640px;margin-bottom:26px;}
+.source-label {font-size:11px;letter-spacing:1px;text-transform:uppercase;color:#526459;margin:12px 0;}
+.excerpt {white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.75;font-family:Georgia,serif;font-size:1.03rem;border-left:2px solid #61766a;padding:8px 0 8px 18px;color:#353b37;}
+.foot {font-size:12px;color:#62695f;margin-top:22px;}
+a {color:#304b40!important;} :focus-visible {outline:2px solid #304b40!important;outline-offset:3px;}
+@media(max-width:760px){.block-container{padding:1.2rem;}h1{font-size:2.2rem!important;}}
+@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important;}}

@@ -1,7 +1,5 @@
-streamlit
-openai
-numpy
-faiss-cpu
-pypdf
-tiktoken
-rank_bm25
+streamlit==1.64.0
+openai==3.14.1
+numpy==2.3.5
+pypdf==6.10.0
+tiktoken==0.14.0
