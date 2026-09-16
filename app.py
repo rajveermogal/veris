@@ -10,15 +10,6 @@ from chat_engine import gather_context, respond
 
 st.set_page_config(page_title='Veris', layout='centered', initial_sidebar_state='expanded')
 st.markdown('<style>'+Path(__file__).with_name('style.css').read_text()+'</style>', unsafe_allow_html=True)
-# Recovery rules also override an older deployed stylesheet that hid the toolbar.
-st.markdown('''<style>
-[data-testid="stToolbar"]{display:flex!important;visibility:visible!important;}
-[data-testid="stExpandSidebarButton"]{display:flex!important;visibility:visible!important;opacity:1!important;color:#29332c!important;}
-@media(min-width:900px){
-[data-testid="stSidebar"]{display:flex!important;visibility:visible!important;transform:none!important;margin-left:0!important;min-width:280px!important;width:280px!important;max-width:280px!important;}
-[data-testid="stSidebarCollapseButton"]{display:none!important;}
-}
-</style>''',unsafe_allow_html=True)
 for k,v in dict(corpus=None, messages=[], cache={}, generation=0, screen='Chat', calls=0).items():
     if k not in st.session_state: st.session_state[k]=v
 if st.session_state.get('citation_version') != 3:
