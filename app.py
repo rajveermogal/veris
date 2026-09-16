@@ -11,6 +11,9 @@ st.set_page_config(page_title='Veris', layout='centered', initial_sidebar_state=
 st.markdown('<style>'+Path(__file__).with_name('style.css').read_text()+'</style>', unsafe_allow_html=True)
 for k,v in dict(corpus=None, messages=[], cache={}, generation=0, screen='Chat', calls=0).items():
     if k not in st.session_state: st.session_state[k]=v
+if st.session_state.get('citation_version') != 2:
+    st.session_state.cache={}
+    st.session_state.citation_version=2
 
 def replace(candidate):
     st.session_state.corpus=candidate
@@ -102,33 +105,45 @@ if corpus and not has_key:
 if corpus and not selected: st.info('Select a document in the sidebar to continue.')
 
 for i,msg in enumerate(st.session_state.messages):
-    with st.chat_message('user'): st.write(msg['question'])
+    with st.chat_message('user'):
+        st.markdown('<span class="message-role user-role">You</span>',unsafe_allow_html=True)
+        st.write(msg['question'])
     with st.chat_message('assistant'):
+        st.markdown('<span class="message-role assistant-role">Veris</span>',unsafe_allow_html=True)
         st.markdown(msg['answer'])
         if msg.get('sources'):
             with st.expander('Sources · '+str(len(msg['sources']))):
                 for source in msg['sources']:
                     st.caption(f"{source['filename']} · Page {source['page']}")
-                    st.text(source['text'])
+                    if source.get('excerpts'):
+                        for quote in source['excerpts']: st.text(quote)
+                    else: st.caption('This earlier answer has page references only. Ask again for precise excerpts.')
         if msg.get('error'): st.caption('No answer was cached. You can submit the question again.')
 
 question=st.chat_input('Ask about your documents…',disabled=not selected or not has_key,max_chars=2000)
 if question:
+    # Emit the submitted message before retrieval or any blocking API work.
+    with st.chat_message('user'):
+        st.markdown('<span class="message-role user-role">You</span>',unsafe_allow_html=True)
+        st.write(question)
     history=[m for m in st.session_state.messages if not m.get('error') and m.get('scope')==sorted(selected)]
     evidence=gather_context(corpus,question,selected,history)
     key=hashlib.sha256(json.dumps([question,evidence,[(m['question'],m['answer']) for m in history[-3:]]],sort_keys=True).encode()).hexdigest()
     # An immediate retry of the identical question reuses its previous result.
     previous=history[-1] if history else None
-    with st.spinner('Reading and thinking…'):
+    with st.chat_message('assistant'), st.spinner('Reading your documents…'):
+        st.markdown('<span class="message-role assistant-role">Veris</span>',unsafe_allow_html=True)
         try:
-            if previous and previous['question']==question: result=dict(answer=previous['answer'],sources=[s['id'] for s in previous['sources']],status='answered'); evidence=previous['sources']
+            if previous and previous['question']==question and previous.get('citation_version')==2:
+                result=dict(answer=previous['answer'],sources=[s['id'] for s in previous['sources']],excerpts={s['id']:s['excerpts'] for s in previous['sources']},status='answered'); evidence=previous['sources']
             elif key in st.session_state.cache: result=st.session_state.cache[key]
             else:
                 if evidence: st.session_state.calls+=1
                 result=respond(question,evidence,history)
                 st.session_state.cache[key]=result
                 if len(st.session_state.cache)>50: del st.session_state.cache[next(iter(st.session_state.cache))]
-            message=dict(question=question,answer=result['answer'],sources=[h for h in evidence if h['id'] in result['sources']],scope=sorted(selected))
+            sources=[dict(id=h['id'],filename=h['filename'],page=h['page'],excerpts=result.get('excerpts',{}).get(h['id'],[])) for h in evidence if h['id'] in result['sources']]
+            message=dict(question=question,answer=result['answer'],sources=sources,scope=sorted(selected),citation_version=2)
         except Exception:
             message=dict(question=question,answer='I couldn’t complete that answer. Please try again. If it keeps happening, check your API connection and quota in Help & settings.',sources=[],error=True,scope=sorted(selected))
     st.session_state.messages.append(message)

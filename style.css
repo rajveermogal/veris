@@ -17,6 +17,10 @@ button:disabled{background:#e0e3db!important;border-color:#cbd2c8!important;opac
 button:disabled p,button:disabled span{color:#62695f!important;}
 [data-testid="stSidebar"] button{min-height:42px;}
 [data-testid="stChatMessage"]{background:transparent;padding:18px 0;}
+[data-testid="stChatMessage"]:has(.user-role){background:#e7ede8!important;border:1px solid #ced9d0;border-radius:6px;padding:16px 20px;margin:12px 0 12px 8%;}
+[data-testid="stChatMessage"]:has(.assistant-role){background:#efede7!important;border:1px solid #dcd7cc;border-radius:6px;padding:16px 20px;margin:12px 8% 24px 0;}
+.message-role{display:block;font-size:11px;font-weight:650;letter-spacing:.04em;color:#505f56;margin-bottom:6px;}
+[data-testid="stChatMessage"] [data-testid="stExpander"]{background:transparent!important;}
 [data-testid="stChatMessageAvatarAssistant"],[data-testid="stChatMessageAvatarUser"]{display:none;}
 [data-testid="stChatMessageContent"]{min-width:0;overflow-wrap:anywhere;color:#242829;}
 [data-testid="stChatMessageContent"] p{font-size:16px;line-height:1.7;}

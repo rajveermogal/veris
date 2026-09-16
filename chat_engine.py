@@ -1,5 +1,6 @@
 """General document conversation with bounded context and one model call."""
 import json
+import re
 from veris_core import CHAT_MODEL, new_client, retrieve
 
 CONTEXT_CHARS = 18000
@@ -46,8 +47,11 @@ def respond(question, evidence, history, client=None):
     schema = {'type':'object','properties':{
         'answer':{'type':'string'},
         'sources':{'type':'array','items':{'type':'string'}},
+        'excerpts':{'type':'array','items':{'type':'object','properties':{
+            'source_id':{'type':'string'},'quote':{'type':'string'}},
+            'required':['source_id','quote'],'additionalProperties':False}},
         'status':{'type':'string','enum':['answered','clarify','insufficient']}},
-        'required':['answer','sources','status'],'additionalProperties':False}
+        'required':['answer','sources','excerpts','status'],'additionalProperties':False}
     client = client or new_client()
     previous = [dict(question=h['question'][:1000], answer=h['answer'][:1600]) for h in history[-3:]]
     result = client.responses.create(
@@ -60,6 +64,9 @@ def respond(question, evidence, history, client=None):
             "For calculations, require all necessary inputs and explain the calculation briefly. "
             "If ambiguous, ask one useful clarification and set status clarify. If evidence is missing, say what cannot be established and set status insufficient. "
             "Return source IDs only for evidence actually used. An answered document claim requires at least one source. "
+            "For every source ID return one or two short verbatim quotes in excerpts, each at most 400 characters. "
+            "Choose the specific lines supporting the answer, including relevant headings or labels where necessary. "
+            "Copy quotes exactly from that source. Never return entire pages or invent quotes. "
             "Do not include citation markers in the answer; the interface shows your source list separately. No HTML, remote images or links."),
         input=json.dumps(dict(question=question[:2000], conversation=previous, evidence=evidence), ensure_ascii=False),
         text={'format':{'type':'json_schema','name':'document_answer','strict':True,'schema':schema}},
@@ -74,4 +81,16 @@ def respond(question, evidence, history, client=None):
         raise ValueError('Invalid status')
     if data['status'] == 'answered' and not data['sources']:
         raise ValueError('Missing evidence')
+    source_text={h['id']:re.sub(r'\s+',' ',h['text']).strip() for h in evidence}
+    excerpts={}
+    for item in data.get('excerpts',[]):
+        if not isinstance(item,dict): raise ValueError('Invalid excerpt')
+        sid=item.get('source_id'); quote=item.get('quote')
+        if sid not in data['sources'] or not isinstance(quote,str): raise ValueError('Invalid excerpt source')
+        quote=re.sub(r'\s+',' ',quote).strip()
+        if not quote or len(quote)>500 or quote not in source_text[sid]: raise ValueError('Quote is not present in source')
+        if len(excerpts.get(sid,[]))>=2: raise ValueError('Too many excerpts')
+        excerpts.setdefault(sid,[]).append(quote)
+    if any(sid not in excerpts for sid in data['sources']): raise ValueError('Missing source excerpt')
+    data['excerpts']=excerpts
     return data
