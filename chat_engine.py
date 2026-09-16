@@ -10,8 +10,9 @@ def gather_context(corpus, question, selected, history):
     for p in corpus.passages:
         if p.filename in selected:
             key = (p.filename, p.page)
-            if p.page_text:
-                pages[key] = p.page_text
+            page_text = getattr(p, 'page_text', '')
+            if page_text:
+                pages[key] = page_text
             elif key not in pages:
                 pages[key] = p.text
             elif p.text not in pages[key]:
